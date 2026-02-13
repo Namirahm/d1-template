@@ -170,6 +170,22 @@ export default {
       });
     }
 
+    // GET /assets/:r2Key  (R2 proxy)
+    if (request.method === "GET" && url.pathname.startsWith("/assets/")) {
+  const key = decodeURIComponent(url.pathname.slice("/assets/".length));
+  if (!key) return new Response("Missing R2 key", { status: 400 });
+
+  const obj = await env.BUCKET.get(key);
+  if (!obj) return new Response("Not found", { status: 404 });
+
+  const headers = new Headers();
+  headers.set("cache-control", "public, max-age=31536000, immutable");
+  headers.set("content-type", obj.httpMetadata?.contentType || "application/octet-stream");
+
+  return new Response(obj.body, { headers });
+    }
+
+
     if (request.method === "GET" && url.pathname === "/api/health") {
       const row = await env.DB.prepare("SELECT 1 AS ok").first();
       return jsonResponse(row);
