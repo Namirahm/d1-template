@@ -27,9 +27,28 @@ function assertString(x: unknown, name: string): string {
 function validateManifest(manifest: any) {
   if (!manifest || typeof manifest !== "object") throw new Error("Manifest must be an object");
   if (manifest.schemaVersion !== 1) throw new Error("schemaVersion must be 1");
-  if (typeof manifest.title !== "string" || !manifest.title.trim()) throw new Error("title required");
-  if (typeof manifest.slug !== "string" || !manifest.slug.trim()) throw new Error("slug required");
 
+  // Accept either:
+  // (A) new structure: manifest.issue.title + manifest.issue.slug
+  // (B) legacy structure: manifest.title + manifest.slug
+  const issueTitle = manifest?.issue?.title;
+  const issueSlug = manifest?.issue?.slug;
+
+  const legacyTitle = manifest?.title;
+  const legacySlug = manifest?.slug;
+
+  const title =
+    (typeof issueTitle === "string" && issueTitle.trim()) ||
+    (typeof legacyTitle === "string" && legacyTitle.trim());
+
+  const slug =
+    (typeof issueSlug === "string" && issueSlug.trim()) ||
+    (typeof legacySlug === "string" && legacySlug.trim());
+
+  if (!title) throw new Error("issue.title (or top-level title) required");
+  if (!slug) throw new Error("issue.slug (or top-level slug) required");
+
+  // Validate pages
   if (!Array.isArray(manifest.pages)) throw new Error("pages must be an array");
   for (const [i, p] of manifest.pages.entries()) {
     if (!p || typeof p !== "object") throw new Error(`pages[${i}] must be an object`);
@@ -38,8 +57,12 @@ function validateManifest(manifest: any) {
     if (!p.image || typeof p.image !== "object") throw new Error(`pages[${i}].image required`);
     if (typeof p.image.r2Key !== "string" || !p.image.r2Key.trim())
       throw new Error(`pages[${i}].image.r2Key required`);
+
+    if (p.pageNumber !== undefined && (typeof p.pageNumber !== "number" || !Number.isFinite(p.pageNumber)))
+      throw new Error(`pages[${i}].pageNumber must be a number if provided`);
   }
 }
+
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -103,8 +126,20 @@ export default {
         return jsonResponse({ error: `Manifest validation failed: ${e.message}` }, 422);
       }
 
-      const slug = (body.slug && body.slug.trim()) || manifest.slug.trim();
-      const title = manifest.title.trim();
+      const manifestTitle =
+        (typeof manifest?.issue?.title === "string" && manifest.issue.title.trim()) ||
+        (typeof manifest?.title === "string" && manifest.title.trim()) ||
+      "";
+
+      const manifestSlug =
+        (typeof manifest?.issue?.slug === "string" && manifest.issue.slug.trim()) ||
+        (typeof manifest?.slug === "string" && manifest.slug.trim()) ||
+      "";
+
+// Allow override via request body.slug, otherwise use manifest-derived slug
+      const slug = (body.slug && body.slug.trim()) || manifestSlug;
+      const title = manifestTitle;
+
 
       // Upsert cached manifest
       // D1 does not support a native UPSERT with RETURNING everywhere; do insert-then-update fallback.
