@@ -11,6 +11,14 @@
 			"remote": true
 		}
 	],
+
+		"r2_buckets": [
+		{
+		"binding": "BUCKET",
+		"bucket_name": "comic-media"
+		}
+	],
+
 	"observability": {
 		"enabled": true
 	}
