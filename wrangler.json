@@ -3,6 +3,9 @@
 	"main": "src/index.ts",
 	"name": "comic-yore-worker",
 	"upload_source_maps": true,
+	"vars": {
+ 			 "GITHUB_OAUTH_CLIENT_ID": "Iv23liuO7YWyZtCzG5jQ"
+		},
 	"d1_databases": [
 		{
 			"binding": "DB",
