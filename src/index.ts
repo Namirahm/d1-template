@@ -86,6 +86,38 @@ function pickPage(manifest: any, pageNumber: number): any | null {
   return manifest.pages[pageNumber - 1] ?? null;
 }
 
+function matchPath(pathname: string, pattern: string): Record<string, string> | null {
+  const p = pathname.split("/").filter(Boolean);
+  const q = pattern.split("/").filter(Boolean);
+  if (p.length !== q.length) return null;
+  const out: Record<string, string> = {};
+  for (let i = 0; i < q.length; i++) {
+    const seg = q[i];
+    if (seg.startsWith(":")) out[seg.slice(1)] = decodeURIComponent(p[i]);
+    else if (seg !== p[i]) return null;
+  }
+  return out;
+}
+
+async function requirePublisherRole(
+  env: Env,
+  userId: string,
+  publisherSlug: string,
+  roles: string[]
+): Promise<{ publisher_id: string } | null> {
+  const row = await env.DB.prepare(
+    `SELECT p.id AS publisher_id
+     FROM publishers p
+     JOIN publisher_members m ON m.publisher_id = p.id
+     WHERE p.slug = ? AND m.user_id = ? AND m.role IN (${roles.map(() => "?").join(",")})
+     LIMIT 1`
+  )
+    .bind(publisherSlug, userId, ...roles)
+    .first<{ publisher_id: string }>();
+  return row ?? null;
+}
+
+
 // ---------- cookies + crypto helpers ----------
 
 function cookie(
@@ -530,6 +562,246 @@ export default {
       if (!user) return jsonResponse({ authenticated: false }, 200);
       return jsonResponse({ authenticated: true, user }, 200);
     }
+
+    //GET /api/publishers
+    if (request.method === "GET" && url.pathname === "/api/publishers") {
+      const rows = await env.DB.prepare(`SELECT slug, name FROM publishers ORDER BY name ASC`).all();
+      return jsonResponse({ ok: true, publishers: rows.results }, 200);
+    }
+
+    //POST /api/repos/register
+    if (request.method === "POST" && url.pathname === "/api/repos/register") {
+  const user = await requireUser(request, env);
+  if (!user) return new Response("Unauthorized", { status: 401 });
+
+  const body = await request.json().catch(() => null) as any;
+  const github_owner = assertString(body?.github_owner, "github_owner");
+  const github_repo = assertString(body?.github_repo, "github_repo");
+  const branch = (typeof body?.branch === "string" && body.branch.trim()) ? body.branch.trim() : "main";
+  const manifest_path =
+    (typeof body?.manifest_path === "string" && body.manifest_path.trim())
+      ? body.manifest_path.trim()
+      : "comicyore/manifest.json";
+
+  const id = `repo_${crypto.randomUUID()}`;
+
+  await env.DB.prepare(
+    `INSERT INTO repos (id, github_owner, github_repo, branch, manifest_path, owner_user_id)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  )
+    .bind(id, github_owner, github_repo, branch, manifest_path, user.id)
+    .run();
+
+  return jsonResponse({ ok: true, id }, 200);
+}
+
+
+    // POST /api/publishers/:publisherSlug/comics/:comicSlug/issues/:issueSlug/publish
+      {
+  const m = matchPath(url.pathname, "/api/publishers/:publisherSlug/comics/:comicSlug/issues/:issueSlug/publish");
+  if (request.method === "POST" && m) {
+    const user = await requireUser(request, env);
+    if (!user) return new Response("Unauthorized", { status: 401 });
+
+    const access = await requirePublisherRole(env, user.id, m.publisherSlug, ["owner", "editor"]);
+    if (!access) return new Response("Forbidden", { status: 403 });
+
+    // Find the source repo+issue in your current comics cache (by issue slug)
+    // Assumes: the issue slug equals `comics.slug` in your current cache.
+    const src = await env.DB.prepare(
+      `SELECT c.repo_id, c.slug AS issue_slug, c.title AS issue_title, c.cached_manifest_json
+       FROM comics c
+       JOIN publisher_repos pr ON pr.repo_id = c.repo_id
+       WHERE pr.publisher_id = ? AND c.slug = ?
+       ORDER BY c.cached_at DESC
+       LIMIT 1`
+    )
+      .bind(access.publisher_id, m.issueSlug)
+      .first<{ repo_id: string; issue_slug: string; issue_title: string; cached_manifest_json: string }>();
+
+    if (!src?.cached_manifest_json) return jsonResponse({ error: "Issue not found in cache" }, 404);
+
+    const manifest = JSON.parse(src.cached_manifest_json);
+    const comicTitle =
+      (typeof manifest?.comic?.title === "string" && manifest.comic.title.trim()) ||
+      (typeof manifest?.comic?.name === "string" && manifest.comic.name.trim()) ||
+      m.comicSlug;
+
+    // Mark cached issue as published
+    await env.DB.prepare(
+      `UPDATE comics SET is_published=1, published_at=datetime('now'), updated_at=datetime('now')
+       WHERE repo_id=? AND slug=?`
+    )
+      .bind(src.repo_id, src.issue_slug)
+      .run();
+
+    // Upsert public mapping
+    await env.DB.prepare(
+      `INSERT INTO comics_public
+        (id, publisher_id, comic_slug, issue_slug, comic_title, issue_title, repo_id, source_comic_slug,
+         is_published, published_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'))
+       ON CONFLICT(publisher_id, comic_slug, issue_slug) DO UPDATE SET
+         comic_title=excluded.comic_title,
+         issue_title=excluded.issue_title,
+         repo_id=excluded.repo_id,
+         source_comic_slug=excluded.source_comic_slug,
+         is_published=1,
+         published_at=datetime('now'),
+         updated_at=datetime('now')`
+    )
+      .bind(
+        `pub_${access.publisher_id}_${m.comicSlug}_${m.issueSlug}`,
+        access.publisher_id,
+        m.comicSlug,
+        m.issueSlug,
+        comicTitle,
+        src.issue_title,
+        src.repo_id,
+        m.comicSlug
+      )
+      .run();
+
+    return jsonResponse({ ok: true }, 200);
+  }
+}
+    //POST /api/publishers/:publisherSlug/comics/:comicSlug/issues/:issueSlug/unpublish  
+      {
+  const m = matchPath(url.pathname, "/api/publishers/:publisherSlug/comics/:comicSlug/issues/:issueSlug/unpublish");
+  if (request.method === "POST" && m) {
+    const user = await requireUser(request, env);
+    if (!user) return new Response("Unauthorized", { status: 401 });
+
+    const access = await requirePublisherRole(env, user.id, m.publisherSlug, ["owner", "editor"]);
+    if (!access) return new Response("Forbidden", { status: 403 });
+
+    await env.DB.prepare(
+      `UPDATE comics_public
+       SET is_published=0, updated_at=datetime('now')
+       WHERE publisher_id=? AND comic_slug=? AND issue_slug=?`
+    )
+      .bind(access.publisher_id, m.comicSlug, m.issueSlug)
+      .run();
+
+    return jsonResponse({ ok: true }, 200);
+  }
+}
+    //GET /api/publishers/:publisherSlug/comics
+      {
+  const m = matchPath(url.pathname, "/api/publishers/:publisherSlug/comics");
+  if (request.method === "GET" && m) {
+    const pub = await env.DB.prepare(`SELECT id FROM publishers WHERE slug=? LIMIT 1`)
+      .bind(m.publisherSlug)
+      .first<{ id: string }>();
+    if (!pub) return jsonResponse({ error: "Publisher not found" }, 404);
+
+    const rows = await env.DB.prepare(
+      `SELECT comic_slug, comic_title
+       FROM comics_public
+       WHERE publisher_id=? AND is_published=1
+       GROUP BY comic_slug, comic_title
+       ORDER BY comic_title ASC`
+    )
+      .bind(pub.id)
+      .all();
+
+    return jsonResponse({ ok: true, comics: rows.results }, 200);
+  }
+}
+    //GET /api/publishers/:publisherSlug/comics/:comicSlug/issues
+    {
+  const m = matchPath(url.pathname, "/api/publishers/:publisherSlug/comics/:comicSlug/issues");
+  if (request.method === "GET" && m) {
+    const pub = await env.DB.prepare(`SELECT id FROM publishers WHERE slug=? LIMIT 1`)
+      .bind(m.publisherSlug)
+      .first<{ id: string }>();
+    if (!pub) return jsonResponse({ error: "Publisher not found" }, 404);
+
+    const rows = await env.DB.prepare(
+      `SELECT issue_slug, issue_title, published_at
+       FROM comics_public
+       WHERE publisher_id=? AND comic_slug=? AND is_published=1
+       ORDER BY published_at DESC`
+    )
+      .bind(pub.id, m.comicSlug)
+      .all();
+
+    return jsonResponse({ ok: true, issues: rows.results }, 200);
+  }
+}
+    //GET /p/:publisherSlug/:comicSlug/:issueSlug?page=1
+    {
+  const m = matchPath(url.pathname, "/p/:publisherSlug/:comicSlug/:issueSlug");
+  if (request.method === "GET" && m) {
+    const pageNumber = Math.max(1, parseInt(url.searchParams.get("page") || "1", 10));
+
+    const pub = await env.DB.prepare(`SELECT id FROM publishers WHERE slug=? LIMIT 1`)
+      .bind(m.publisherSlug)
+      .first<{ id: string }>();
+    if (!pub) return new Response("Not found", { status: 404 });
+
+    const pubIssue = await env.DB.prepare(
+      `SELECT repo_id, issue_slug, issue_title
+       FROM comics_public
+       WHERE publisher_id=? AND comic_slug=? AND issue_slug=? AND is_published=1
+       LIMIT 1`
+    )
+      .bind(pub.id, m.comicSlug, m.issueSlug)
+      .first<{ repo_id: string; issue_slug: string; issue_title: string }>();
+
+    if (!pubIssue) return new Response("Not found", { status: 404 });
+
+    const comicRow = await env.DB.prepare(
+      `SELECT cached_manifest_json
+       FROM comics
+       WHERE repo_id=? AND slug=?
+       LIMIT 1`
+    )
+      .bind(pubIssue.repo_id, pubIssue.issue_slug)
+      .first<{ cached_manifest_json: string }>();
+
+    if (!comicRow?.cached_manifest_json) return new Response("Not found", { status: 404 });
+
+    const manifest = JSON.parse(comicRow.cached_manifest_json);
+    const page = pickPage(manifest, pageNumber);
+    if (!page) return new Response("Page not found", { status: 404 });
+
+    const r2Key = page?.image?.r2Key;
+    if (!r2Key || typeof r2Key !== "string") return new Response("Page missing image.r2Key", { status: 404 });
+
+    const imgUrl = `/assets/${encodeURIComponent(r2Key)}`;
+    const title = escapeHtml(pubIssue.issue_title || "Reader");
+    const totalPages = Array.isArray(manifest?.pages) ? manifest.pages.length : 0;
+    const prev = Math.max(1, pageNumber - 1);
+    const next = totalPages ? Math.min(totalPages, pageNumber + 1) : pageNumber + 1;
+
+    const html = `<!doctype html>
+<html><head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>${title}</title>
+<style>
+body{margin:0;font-family:system-ui,sans-serif;}
+.wrap{max-width:1200px;margin:0 auto;padding:12px;}
+img{width:100%;height:auto;display:block;}
+.nav{display:flex;justify-content:space-between;align-items:center;margin:12px 0;}
+a{text-decoration:none;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="nav">
+    <a href="/p/${encodeURIComponent(m.publisherSlug)}/${encodeURIComponent(m.comicSlug)}/${encodeURIComponent(m.issueSlug)}?page=${prev}">Prev</a>
+    <div>Page ${pageNumber}${totalPages ? " / " + totalPages : ""}</div>
+    <a href="/p/${encodeURIComponent(m.publisherSlug)}/${encodeURIComponent(m.comicSlug)}/${encodeURIComponent(m.issueSlug)}?page=${next}">Next</a>
+  </div>
+  <img src="${imgUrl}" alt="Page ${pageNumber}" />
+</div>
+</body></html>`;
+
+    return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
+  }
+}
 
 
     return new Response("Not found", { status: 404 });
